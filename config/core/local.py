@@ -4,6 +4,7 @@ from .base import *
 DEBUG = True
 ALLOWED_HOSTS = ["*"]
 
+
 # Logging: file + console for local development
 LOGGING = {
             'version': 1,
@@ -47,3 +48,6 @@ SESSION_COOKIE_SECURE = False
 
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
+
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://localhost:6380/0")
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default=CELERY_BROKER_URL)

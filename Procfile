@@ -1,3 +1,3 @@
-web: gunicorn core.wsgi --log-file -
+web: gunicorn config.wsgi:application --log-file -
 
-worker: celery -A core worker --loglevel=info
+worker: celery -A config worker --loglevel=info
