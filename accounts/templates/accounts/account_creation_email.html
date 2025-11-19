@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    />
+    <title>Set Your Password – Dental Software LTD</title>
+    <style>
+        /* Basic reset for email clients */
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f4f4f4;
+            font-family: Arial, sans-serif;
+            color: #333333;
+        }
+        .wrapper {
+            width: 100%;
+            background-color: #f4f4f4;
+            padding: 20px 0;
+        }
+        .email-container {
+            width: 100%;
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            padding: 24px 20px 28px;
+            border: 1px solid #dddddd;
+            box-sizing: border-box;
+        }
+        h2 {
+            margin-top: 0;
+            color: #1d4ed8; /* slightly more “software” blue */
+            font-size: 22px;
+        }
+        p {
+            font-size: 15px;
+            line-height: 1.6;
+            margin: 0 0 12px;
+        }
+        .btn-container {
+            margin: 20px 0;
+            text-align: left;
+        }
+        .btn {
+            display: inline-block;
+            padding: 10px 18px;
+            background-color: #1d4ed8;
+            color: #ffffff !important;
+            text-decoration: none;
+            font-weight: bold;
+            border-radius: 4px;
+            font-size: 15px;
+        }
+        .btn:hover {
+            text-decoration: none;
+        }
+        .small {
+            font-size: 13px;
+            color: #666666;
+        }
+        .footer {
+            margin-top: 20px;
+            font-size: 12px;
+            color: #999999;
+        }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="email-container">
+            <h2>Welcome to Dental Software LTD</h2>
+
+            <p>Hello {{ user_name }},</p>
+
+            <p>
+                Your account has been created successfully by your administrator.
+                To get started, please set your password using the link below:
+            </p>
+
+            <div class="btn-container">
+                <a href="{{ reset_url }}" target="_blank" class="btn">
+                    Set Your Password
+                </a>
+            </div>
+
+            <p class="small">
+                If the button above does not work, copy and paste the link
+                below into your browser:
+                <br />
+                <a href="{{ reset_url }}" target="_blank">{{ reset_url }}</a>
+            </p>
+
+            <p class="small">
+                If you did not expect this email, you can safely ignore it or
+                contact your clinic administrator.
+            </p>
+
+            <div class="footer">
+                &copy; {{ now|date:"Y" }} Dental Software LTD. All rights reserved.
+            </div>
+        </div>
+    </div>
+</body>
+</html>

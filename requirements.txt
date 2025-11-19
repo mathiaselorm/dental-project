@@ -1,0 +1,14 @@
+django
+dj-database-url
+djangorestframework
+gunicorn
+psycopg2
+pillow
+drf-spectacular
+django-cors-headers
+django-heroku
+django-filter
+django-environs
+whitenoise
+redis
+celery
