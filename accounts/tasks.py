@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import logging
 
 from celery import shared_task
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.mail import EmailMultiAlternatives
+from django.template import TemplateDoesNotExist
 from django.template.loader import render_to_string
 from django.utils.html import strip_tags
 from django.utils.translation import gettext_lazy as _
@@ -12,120 +15,165 @@ logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
-@shared_task(bind=True, max_retries=3)
+def _default_from_email() -> str:
+    return getattr(settings, "DEFAULT_FROM_EMAIL", "") or "no-reply@example.com"
+
+
+def _send_templated_email(*, to_email: str, subject: str, template: str, context: dict) -> int:
+    """
+    Render a template and send as multipart (text + html).
+    Returns the number of successfully delivered messages (Django convention).
+    """
+    html_content = render_to_string(template, context)
+    text_content = strip_tags(html_content)
+
+    email = EmailMultiAlternatives(
+        subject=str(subject),
+        body=text_content,
+        from_email=_default_from_email(),
+        to=[to_email],
+    )
+    email.attach_alternative(html_content, "text/html")
+    return email.send(fail_silently=False)
+
+
+# ------------------------------------
+# Welcome / onboarding email (optional)
+# ------------------------------------
+@shared_task(
+    bind=True,
+    max_retries=3,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+)
 def send_welcome_email(self, user_pk, reset_url):
     """
     Sends a welcome email with a link to set the user's password.
+
+    Note: In your current architecture, onboarding is handled through
+    send_password_reset_email with created_via="registration". Keeping this task
+    for backward compatibility / optional use.
     """
     try:
         user = User.objects.get(pk=user_pk)
-        if not user.email:
-            logger.error("User with pk %s does not have an email address.", user_pk)
-            return
-
-        subject = _("Set Your Password")
-        context = {
-            "user": user,
-            "reset_url": reset_url,
-        }
-
-        html_content = render_to_string("accounts/account_creation_email.html", context)
-        text_content = strip_tags(html_content)
-
-        email = EmailMultiAlternatives(
-            subject=subject,
-            body=text_content,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            to=[user.email],
-        )
-        email.attach_alternative(html_content, "text/html")
-        email.send()
-
-        logger.info("Welcome email sent to %s.", user.email)
-
     except User.DoesNotExist:
-        logger.error(
-            "User with pk %s does not exist. Welcome email not sent.", user_pk
+        logger.warning("Welcome email not sent: user %s does not exist.", user_pk)
+        return 0
+
+    if not user.email:
+        logger.warning("Welcome email not sent: user %s has no email.", user_pk)
+        return 0
+
+    try:
+        subject = _("Set Your Password")
+        context = {"user": user, "reset_url": reset_url}
+        sent = _send_templated_email(
+            to_email=user.email,
+            subject=subject,
+            template="accounts/account_creation_email.html",
+            context=context,
         )
-    except Exception as e:
-        logger.error(
-            "Error sending welcome email to %s: %s",
-            user.email if "user" in locals() else "Unknown",
-            e,
-        )
-        self.retry(exc=e, countdown=60)
+        logger.info("Welcome email queued/sent to %s (task_id=%s).", user.email, getattr(self.request, "id", None))
+        return sent
+
+    except TemplateDoesNotExist as e:
+        # This is a code/config error; retrying won't help.
+        logger.error("Welcome email template missing: %s", e)
+        return 0
 
 
-@shared_task(bind=True, max_retries=3)
+# ------------------------------------
+# Password reset / set-password email
+# ------------------------------------
+@shared_task(
+    bind=True,
+    max_retries=3,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+)
 def send_password_reset_email(self, user_id, subject, email_template, context):
     """
-    Sends a password reset (or account creation) email to the user.
+    Sends a password reset (or account creation set-password) email to the user.
+
+    Retries are enabled for transient failures (network/email provider).
+    Non-recoverable failures (user missing, template missing) do not retry.
     """
     try:
         user = User.objects.get(pk=user_id)
-        if not user.email:
-            logger.error("User with id %s does not have an email address.", user_id)
-            return
-
-        html_content = render_to_string(email_template, context)
-        text_content = strip_tags(html_content)
-
-        email = EmailMultiAlternatives(
-            subject=subject,
-            body=text_content,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            to=[user.email],
-        )
-        email.attach_alternative(html_content, "text/html")
-        email.send()
-
-        logger.info("Password reset email sent to %s.", user.email)
-
     except User.DoesNotExist:
-        logger.error("User with id %s does not exist. Email not sent.", user_id)
-    except Exception as e:
-        logger.error(
-            "Error sending password reset email to %s: %s",
-            user.email if "user" in locals() else "Unknown",
-            e,
+        logger.warning("Password reset email not sent: user %s does not exist.", user_id)
+        return 0
+
+    if not user.email:
+        logger.warning("Password reset email not sent: user %s has no email.", user_id)
+        return 0
+
+    # Ensure templates always have a predictable "user_name"
+    context = dict(context or {})
+    context.setdefault("user_name", user.get_full_name() or user.email)
+
+    try:
+        sent = _send_templated_email(
+            to_email=user.email,
+            subject=subject,
+            template=email_template,
+            context=context,
         )
-        self.retry(exc=e, countdown=60)
+        logger.info(
+            "Password reset/set-password email queued/sent to %s (task_id=%s).",
+            user.email,
+            getattr(self.request, "id", None),
+        )
+        return sent
+
+    except TemplateDoesNotExist as e:
+        logger.error("Password reset email template missing (%s): %s", email_template, e)
+        return 0
 
 
-@shared_task(bind=True, max_retries=3)
+# ------------------------------------
+# Password change notification
+# ------------------------------------
+@shared_task(
+    bind=True,
+    max_retries=3,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+)
 def send_password_change_email(self, user_id):
     """
     Sends a password change notification email to the user.
     """
     try:
         user = User.objects.get(pk=user_id)
-        if not user.email:
-            logger.error("User with id %s does not have an email address.", user_id)
-            return
-
-        subject = _("Password Changed Successfully")
-        context = {"user_name": user.get_full_name()}
-
-        html_content = render_to_string("accounts/password_change.html", context)
-        text_content = strip_tags(html_content)
-
-        email = EmailMultiAlternatives(
-            subject=subject,
-            body=text_content,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            to=[user.email],
-        )
-        email.attach_alternative(html_content, "text/html")
-        email.send()
-
-        logger.info("Password change notification email sent to %s.", user.email)
-
     except User.DoesNotExist:
-        logger.error("User with id %s does not exist. Email not sent.", user_id)
-    except Exception as e:
-        logger.error(
-            "Error sending password change email to %s: %s",
-            user.email if "user" in locals() else "Unknown",
-            e,
+        logger.warning("Password change email not sent: user %s does not exist.", user_id)
+        return 0
+
+    if not user.email:
+        logger.warning("Password change email not sent: user %s has no email.", user_id)
+        return 0
+
+    try:
+        subject = _("Password Changed Successfully")
+        context = {"user_name": user.get_full_name() or user.email}
+
+        sent = _send_templated_email(
+            to_email=user.email,
+            subject=subject,
+            template="accounts/password_change.html",
+            context=context,
         )
-        self.retry(exc=e, countdown=60)
+        logger.info(
+            "Password change email queued/sent to %s (task_id=%s).",
+            user.email,
+            getattr(self.request, "id", None),
+        )
+        return sent
+
+    except TemplateDoesNotExist as e:
+        logger.error("Password change email template missing: %s", e)
+        return 0

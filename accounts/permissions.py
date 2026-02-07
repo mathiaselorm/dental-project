@@ -1,24 +1,60 @@
+from __future__ import annotations
+
 from rest_framework import permissions
-from django.contrib.auth import get_user_model
+
 from .models import UserRole
 
-User = get_user_model()
 
+class BaseRolePermission(permissions.BasePermission):
+    """
+    Base permission for role checks.
 
-class IsAdmin(permissions.BasePermission):
+    - Always denies anonymous users.
+    - Superusers always pass.
+    - Concrete subclasses set `allowed_roles`.
     """
-    Custom permission to allow only Admins to access specific views.
-    """
+
+    allowed_roles: tuple[str, ...] = ()
+
     def has_permission(self, request, view):
-        user = request.user
-        # Check if the user is authenticated and has the Admin role
-        return user.is_authenticated and user.is_superuser or user.user_role == UserRole.ADMIN
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
+            return False
+        if user.is_superuser:
+            return True
+        return bool(user.user_role in self.allowed_roles)
 
-class IsDentist(permissions.BasePermission):
+
+class IsAdmin(BaseRolePermission):
     """
-    Custom permission to allow only Dentist to access specific views.
+    Allows access to business Admin users (and superusers).
     """
-    def has_permission(self, request, view):
-        user = request.user
-        # Check if the user is authenticated and has the Dentist role
-        return user.is_authenticated and user.user_role == UserRole.DENTIST
+    allowed_roles = (UserRole.ADMIN,)
+
+
+class IsDentist(BaseRolePermission):
+    """
+    Allows access to Dentist users (and superusers).
+    """
+    allowed_roles = (UserRole.DENTIST,)
+
+
+class IsSecretary(BaseRolePermission):
+    """
+    Allows access to Secretary users (and superusers).
+    """
+    allowed_roles = (UserRole.SECRETARY,)
+
+
+class IsClinicalStaff(BaseRolePermission):
+    """
+    Dentist + Admin (and superusers). Useful for clinical modules.
+    """
+    allowed_roles = (UserRole.DENTIST, UserRole.ADMIN)
+
+
+class IsFrontDeskStaff(BaseRolePermission):
+    """
+    Secretary + Admin (and superusers). Useful for patient registration & billing.
+    """
+    allowed_roles = (UserRole.SECRETARY, UserRole.ADMIN)

@@ -7,3 +7,4 @@ class AccountsConfig(AppConfig):
 
     def ready(self):
         import accounts.signals  # noqa
+        import accounts.openapi  # noqa: Register OpenAPI extensions

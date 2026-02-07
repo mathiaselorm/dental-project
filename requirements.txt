@@ -21,11 +21,13 @@ django-environ==0.12.0
 django-environs==0.1.1
 django-filter==25.2
 django-heroku==0.3.1
+django-model-utils==5.0.0
 django-rest-passwordreset==1.5.0
 djangorestframework==3.16.1
 djangorestframework_simplejwt==5.5.1
 drf-spectacular==0.29.0
 environs==14.5.0
+et_xmlfile==2.0.0
 gunicorn==23.0.0
 idna==3.11
 inflection==0.5.1
@@ -33,6 +35,7 @@ jsonschema==4.25.1
 jsonschema-specifications==2025.9.1
 kombu==5.5.4
 marshmallow==4.1.0
+openpyxl==3.1.5
 packaging==25.0
 pillow==12.0.0
 prompt_toolkit==3.0.52

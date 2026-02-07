@@ -50,6 +50,7 @@ INSTALLED_APPS = [
     
     # installed apps
     'accounts.apps.AccountsConfig',
+    'patients.apps.PatientsConfig',
     
 ]
 
@@ -70,6 +71,9 @@ REST_FRAMEWORK = {
         # 'rest_framework_simplejwt.authentication.JWTAuthentication',
         'accounts.authentication.CookieJWTAuthentication',
     ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
     'DEFAULT_FILTER_BACKENDS': [
         'django_filters.rest_framework.DjangoFilterBackend',
         'rest_framework.filters.OrderingFilter',
@@ -78,9 +82,31 @@ REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
+
+ROLE_DEFAULT_PERMISSIONS = {
+    # Admin defaults to "*" automatically if omitted, but keeping explicit is fine
+    "Admin": ["*"],
+
+    # Keep these minimal now; extend after patients/appointments/invoices models are ready
+    "Secretary": [
+        # Example (enable once those models exist):
+        # "patients.view_patient",
+        # "patients.add_patient",
+        # "patients.change_patient",
+    ],
+    "Dentist": [
+        # Example (enable once those models exist):
+        # "patients.view_patient",
+        # "patients.view_clinicalvisit",
+        # "patients.add_clinicalvisit",
+        # "patients.change_clinicalvisit",
+    ],
+}
+
+
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
-    "REFRESH_TOKEN_LIFETIME": timedelta(minutes=60),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
     "UPDATE_LAST_LOGIN": False,
@@ -159,7 +185,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Africa/Accra'
 
 USE_I18N = True
 
@@ -252,3 +278,15 @@ CELERY_WORKER_REDIRECT_STDOUTS_LEVEL = 'DEBUG'
 #         'schedule': 60.0,
 #     },
 # }
+
+# Celery Beat Schedule for periodic tasks
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    # Cleanup old import/export files every day at 2 AM
+    'cleanup-old-import-export-files': {
+        'task': 'patients.tasks.cleanup_old_import_export_files',
+        'schedule': crontab(hour=2, minute=0),
+        'kwargs': {'days_old': 7},
+    },
+}

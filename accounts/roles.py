@@ -1,3 +1,5 @@
+# These group names MUST exist in Django Admin (auth.Group)
+
 from .models import UserRole
 
 # Map your user_role codes to Django Group names

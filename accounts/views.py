@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -5,78 +7,133 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.middleware.csrf import get_token
+from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.csrf import ensure_csrf_cookie
 
-from rest_framework import generics, status, serializers
-from rest_framework.decorators import api_view
+from rest_framework import generics, serializers, status
+from rest_framework.decorators import (
+    api_view,
+    authentication_classes,
+    permission_classes,
+    throttle_classes,
+)
 from rest_framework.exceptions import ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
-from drf_spectacular.utils import (
-    extend_schema,
-    OpenApiResponse,
-    inline_serializer,
-)
+from drf_spectacular.utils import OpenApiResponse, extend_schema, inline_serializer
 
-from rest_framework_simplejwt.exceptions import TokenError, AuthenticationFailed
+from rest_framework_simplejwt.exceptions import AuthenticationFailed, TokenError
 from rest_framework_simplejwt.settings import api_settings
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from django_rest_passwordreset.views import (
-    ResetPasswordRequestToken,
     ResetPasswordConfirm,
+    ResetPasswordRequestToken,
     ResetPasswordValidateToken,
 )
 
 from .permissions import IsAdmin
 from .serializers import (
-    UserRegistrationSerializer,
     CustomTokenObtainPairSerializer,
     PasswordChangeSerializer,
-    UserSerializer,
-    UserPermissionsSerializer,
     PermissionSerializer,
+    UserPermissionsSerializer,
+    UserRegistrationSerializer,
+    UserSerializer,
 )
 from .tasks import send_password_change_email
-
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
+# -----------------------------
+# Throttling (self-contained)
+# -----------------------------
+class _IPThrottle(SimpleRateThrottle):
+    """
+    IP-based throttle that does not require DEFAULT_THROTTLE_RATES in settings.
+    Each subclass sets `rate` and `scope`.
+    """
+    scope = "ip"
+    rate = "60/min"
+
+    def get_cache_key(self, request, view):
+        ident = self.get_ident(request)
+        return self.cache_format % {"scope": self.scope, "ident": ident}
+
+    def get_rate(self):
+        return self.rate
+
+
+class LoginThrottle(_IPThrottle):
+    scope = "auth_login"
+    rate = "10/min"
+
+
+class RefreshThrottle(_IPThrottle):
+    scope = "auth_refresh"
+    rate = "30/min"
+
+
+class PasswordResetThrottle(_IPThrottle):
+    scope = "auth_password_reset"
+    rate = "5/min"
+
+
+# -----------------------------
+# Cookie helpers
+# -----------------------------
 def _seconds_until_exp(jwt_token_obj):
     """
-    Return the number of seconds until a token's `exp` claim.
-
-    Handles both integer timestamps and `datetime` values.
-    Returns None if the claim is missing or cannot be parsed.
+    Return seconds until `exp` claim. Handles datetime or int timestamps.
+    Returns None if claim missing/unparseable.
     """
     try:
         exp = jwt_token_obj.get("exp", None)
         if exp is None:
             return None
 
-        if hasattr(exp, "timestamp"):
-            exp_ts = exp.timestamp()
-        else:
-            exp_ts = int(exp)
-
+        exp_ts = exp.timestamp() if hasattr(exp, "timestamp") else int(exp)
         now_ts = datetime.now(timezone.utc).timestamp()
-        secs = int(exp_ts - now_ts)
-        return max(secs, 0)
+        return max(int(exp_ts - now_ts), 0)
     except Exception:
         return None
+
+
+def _cookie_domain():
+    """
+    Prefer a dedicated JWT cookie domain if you add it later; otherwise fall back.
+    """
+    return getattr(settings, "JWT_COOKIE_DOMAIN", None) or getattr(settings, "SESSION_COOKIE_DOMAIN", None)
+
+
+def _cookie_secure_flag():
+    """
+    Secure cookies in production, non-secure in local dev (http://localhost).
+    """
+    return getattr(settings, "JWT_COOKIE_SECURE", getattr(settings, "SESSION_COOKIE_SECURE", not settings.DEBUG))
+
+
+def _cookie_samesite(secure_flag: bool):
+    """
+    SameSite=None requires Secure=True. For local dev over http, use Lax.
+    """
+    return "None" if secure_flag else "Lax"
 
 
 def set_auth_cookies(response, access_token_obj, refresh_token_obj, remember_me=False, request=None):
     """
     Sets `access_token` and `refresh_token` as HttpOnly cookies.
 
-    - Cookie lifetimes are aligned with the tokens' actual `exp` values when possible.
-    - Falls back to SIMPLE_JWT lifetimes if the exp claim cannot be read.
+    - Cookie lifetimes align with token `exp` values when possible.
+    - Falls back to SIMPLE_JWT lifetimes if `exp` cannot be read.
+    - Also ensures CSRF token exists (middleware will set csrftoken cookie).
     """
     access_max = _seconds_until_exp(access_token_obj)
     refresh_max = _seconds_until_exp(refresh_token_obj)
@@ -88,17 +145,18 @@ def set_auth_cookies(response, access_token_obj, refresh_token_obj, remember_me=
         fallback = timedelta(days=5) if remember_me else api_settings.REFRESH_TOKEN_LIFETIME
         refresh_max = int(fallback.total_seconds())
 
-    secure_flag = getattr(settings, "SESSION_COOKIE_SECURE", True)
-    cookie_domain = getattr(settings, "SESSION_COOKIE_DOMAIN", None)
+    secure_flag = _cookie_secure_flag()
+    same_site = _cookie_samesite(secure_flag)
+    domain = _cookie_domain()
 
     response.set_cookie(
         key="access_token",
         value=str(access_token_obj),
         httponly=True,
         secure=secure_flag,
-        samesite="None",
+        samesite=same_site,
         max_age=access_max,
-        domain=cookie_domain,
+        domain=domain,
         path="/",
     )
     response.set_cookie(
@@ -106,27 +164,51 @@ def set_auth_cookies(response, access_token_obj, refresh_token_obj, remember_me=
         value=str(refresh_token_obj),
         httponly=True,
         secure=secure_flag,
-        samesite="None",
+        samesite=same_site,
         max_age=refresh_max,
-        domain=cookie_domain,
+        domain=domain,
         path="/",
     )
 
-    # Ensure CSRF token is available (CsrfViewMiddleware will set the cookie)
+    # Ensure CSRF token exists (CsrfViewMiddleware sets cookie)
     if request is not None:
         get_token(request)
 
 
 def delete_auth_cookies(response):
     """
-    Deletes `access_token`, `refresh_token`, and `csrftoken` cookies.
+    Deletes access/refresh JWT cookies and csrftoken cookie.
     """
-    cookie_domain = getattr(settings, "SESSION_COOKIE_DOMAIN", None)
+    domain = _cookie_domain()
     for name in ("access_token", "refresh_token", "csrftoken"):
-        response.delete_cookie(name, domain=cookie_domain, path="/")
+        response.delete_cookie(name, domain=domain, path="/")
     logger.info("Auth cookies cleared.")
 
 
+# -----------------------------
+# CSRF bootstrap endpoint
+# -----------------------------
+@extend_schema(
+    summary="Set CSRF cookie",
+    description="Sets csrftoken cookie for browser clients before calling POST endpoints like login/refresh.",
+    responses={200: OpenApiResponse(description="CSRF cookie set.")},
+    tags=["Authentication"],
+)
+class CSRFCookieView(APIView):
+    """
+    Browser clients should call this first (GET) to receive csrftoken cookie.
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    @method_decorator(ensure_csrf_cookie)
+    def get(self, request, *args, **kwargs):
+        return Response({"detail": "CSRF cookie set."}, status=status.HTTP_200_OK)
+
+
+# -----------------------------
+# User registration (admin only)
+# -----------------------------
 @extend_schema(
     summary="Register a new user",
     description="Registers a new user account. Only authenticated Admin users can register new users.",
@@ -139,11 +221,6 @@ def delete_auth_cookies(response):
     tags=["User Management"],
 )
 class UserRegistrationView(generics.CreateAPIView):
-    """
-    API endpoint for registering a new user.
-    Only authenticated Admin users can call this.
-    """
-
     serializer_class = UserRegistrationSerializer
     permission_classes = [IsAuthenticated, IsAdmin]
 
@@ -157,12 +234,12 @@ class UserRegistrationView(generics.CreateAPIView):
             user.id,
             request.user.email,
         )
-        return Response(
-            {"message": "User registered successfully."},
-            status=status.HTTP_201_CREATED,
-        )
+        return Response({"message": "User registered successfully."}, status=status.HTTP_201_CREATED)
 
 
+# -----------------------------
+# Login (cookie-based JWT)
+# -----------------------------
 @extend_schema(
     summary="Obtain JWT tokens via cookies",
     description=(
@@ -173,18 +250,9 @@ class UserRegistrationView(generics.CreateAPIView):
     request=inline_serializer(
         name="TokenObtainPairRequest",
         fields={
-            "email": serializers.EmailField(
-                help_text="The email of the user."
-            ),
-            "password": serializers.CharField(
-                help_text="The password of the user.",
-                style={"input_type": "password"},
-            ),
-            "remember_me": serializers.BooleanField(
-                required=False,
-                default=False,
-                help_text="If true, refresh token lifetime is extended.",
-            ),
+            "email": serializers.EmailField(help_text="The email of the user."),
+            "password": serializers.CharField(help_text="The password of the user.", style={"input_type": "password"}),
+            "remember_me": serializers.BooleanField(required=False, default=False),
         },
     ),
     responses={
@@ -195,9 +263,12 @@ class UserRegistrationView(generics.CreateAPIView):
 )
 class CustomTokenObtainPairView(TokenObtainPairView):
     """
-    API endpoint for obtaining JWT tokens.
-    Tokens are set as secure, HttpOnly cookies.
+    Important: disable authentication on this endpoint so an expired access cookie
+    never blocks login.
     """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [LoginThrottle]
 
     serializer_class = CustomTokenObtainPairSerializer
 
@@ -206,7 +277,6 @@ class CustomTokenObtainPairView(TokenObtainPairView):
         try:
             serializer.is_valid(raise_exception=True)
         except AuthenticationFailed:
-            # Normalize error type to DRF ValidationError
             raise ValidationError({"detail": _("Invalid credentials.")})
 
         refresh = serializer.refresh_token_obj
@@ -222,14 +292,23 @@ class CustomTokenObtainPairView(TokenObtainPairView):
         return response
 
 
+# -----------------------------
+# Refresh (cookie-based)
+# -----------------------------
 @extend_schema(
     summary="Refresh JWT access token",
     description=(
         "Refresh the JWT access token using the refresh token stored in HttpOnly cookies. "
         "If refresh rotation is enabled, also issues a new refresh token."
     ),
+    request=None,  # No request body - uses cookie
     responses={
-        200: OpenApiResponse(description="Access token refreshed successfully. Tokens set in cookies."),
+        200: inline_serializer(
+            name="TokenRefreshResponse",
+            fields={
+                "message": serializers.CharField(default="Token refreshed successfully."),
+            },
+        ),
         400: OpenApiResponse(description="Refresh token not found."),
         401: OpenApiResponse(description="Invalid or expired refresh token."),
     },
@@ -237,16 +316,19 @@ class CustomTokenObtainPairView(TokenObtainPairView):
 )
 class CustomTokenRefreshView(APIView):
     """
-    API endpoint for refreshing JWT access tokens from cookies.
+    Important: disable authentication here so an expired access cookie
+    never blocks refresh.
     """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [RefreshThrottle]
 
     def post(self, request, *args, **kwargs):
         refresh_token_str = request.COOKIES.get("refresh_token")
         if not refresh_token_str:
-            return Response(
-                {"error": _("Refresh token not found.")},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            resp = Response({"error": _("Refresh token not found.")}, status=status.HTTP_400_BAD_REQUEST)
+            delete_auth_cookies(resp)
+            return resp
 
         try:
             old_refresh_token = RefreshToken(refresh_token_str)
@@ -255,14 +337,14 @@ class CustomTokenRefreshView(APIView):
             try:
                 user = User.objects.get(id=user_id)
             except User.DoesNotExist:
-                logger.warning(
-                    "Refresh attempt with token for non-existent user ID: %s",
-                    user_id,
-                )
-                resp = Response(
-                    {"error": _("Associated user not found.")},
-                    status=status.HTTP_401_UNAUTHORIZED,
-                )
+                logger.warning("Refresh attempt with token for non-existent user ID: %s", user_id)
+                resp = Response({"error": _("Associated user not found.")}, status=status.HTTP_401_UNAUTHORIZED)
+                delete_auth_cookies(resp)
+                return resp
+
+            if not user.is_active:
+                logger.warning("Refresh attempt for inactive user: %s", user.email)
+                resp = Response({"error": _("Account is inactive.")}, status=status.HTTP_401_UNAUTHORIZED)
                 delete_auth_cookies(resp)
                 return resp
 
@@ -270,22 +352,12 @@ class CustomTokenRefreshView(APIView):
                 claim = tok.get("remember_me", None)
                 if claim is not None:
                     return bool(claim)
-
-                # Legacy tokens without the claim: infer using lifetime vs default
+                # legacy inference
                 try:
                     exp = tok.get("exp")
                     iat = tok.get("iat")
-
-                    if hasattr(exp, "timestamp"):
-                        exp_ts = exp.timestamp()
-                    else:
-                        exp_ts = int(exp)
-
-                    if hasattr(iat, "timestamp"):
-                        iat_ts = iat.timestamp()
-                    else:
-                        iat_ts = int(iat)
-
+                    exp_ts = exp.timestamp() if hasattr(exp, "timestamp") else int(exp)
+                    iat_ts = iat.timestamp() if hasattr(iat, "timestamp") else int(iat)
                     default_secs = int(api_settings.REFRESH_TOKEN_LIFETIME.total_seconds())
                     return (exp_ts - iat_ts) > default_secs
                 except Exception:
@@ -297,18 +369,12 @@ class CustomTokenRefreshView(APIView):
             new_refresh_token_obj = old_refresh_token
 
             if api_settings.ROTATE_REFRESH_TOKENS:
+                # blacklist old token (best-effort)
                 try:
                     old_refresh_token.blacklist()
-                    logger.info(
-                        "Old refresh token for user %s blacklisted during refresh.",
-                        user.email,
-                    )
+                    logger.info("Old refresh token blacklisted for user %s during refresh.", user.email)
                 except Exception as e:
-                    logger.warning(
-                        "Failed to blacklist old refresh token for user %s: %s",
-                        user.email,
-                        e,
-                    )
+                    logger.warning("Failed to blacklist old refresh token for user %s: %s", user.email, e)
 
                 new_refresh = RefreshToken.for_user(user)
                 if remember_me:
@@ -316,20 +382,14 @@ class CustomTokenRefreshView(APIView):
                 new_refresh["remember_me"] = remember_me
                 new_refresh_token_obj = new_refresh
 
-            response = Response(
-                {"message": "Access token refreshed successfully."},
-                status=status.HTTP_200_OK,
-            )
+            response = Response({"message": "Access token refreshed successfully."}, status=status.HTTP_200_OK)
             set_auth_cookies(response, new_access_token, new_refresh_token_obj, remember_me, request)
             logger.info("Access token refreshed for user %s.", user.email)
             return response
 
         except TokenError as e:
-            logger.error(
-                "JWT token refresh error for token %s: %s",
-                request.COOKIES.get("refresh_token", "N/A"),
-                e,
-            )
+            # Do NOT log raw tokens (sensitive). Log only the error.
+            logger.warning("JWT refresh failed: %s", e)
             resp = Response(
                 {"error": _("Token is invalid or expired. Please log in again.")},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -344,71 +404,48 @@ class CustomTokenRefreshView(APIView):
             )
 
 
+# -----------------------------
+# Password reset (public)
+# -----------------------------
 @extend_schema(
     summary="Request password reset",
     description=(
-        "Initiate the password reset process. If the e-mail exists, a reset token "
-        "is created and an e-mail is sent. The response is the same regardless of "
-        "whether the e-mail exists, to avoid information leakage."
+        "Initiate password reset. Response should not reveal whether email exists "
+        "(configure no-leakage in production)."
     ),
     request=inline_serializer(
         name="PasswordResetRequest",
-        fields={
-            "email": serializers.EmailField(
-                help_text="The e-mail address of the user who forgot their password."
-            )
-        },
+        fields={"email": serializers.EmailField(help_text="The user's e-mail address.")},
     ),
     responses={
-        200: OpenApiResponse(description="Password reset e-mail has been sent."),
+        200: OpenApiResponse(description="If the e-mail exists, reset instructions were sent."),
         400: OpenApiResponse(description="Invalid e-mail."),
     },
     tags=["Password Reset"],
 )
 class CustomPasswordResetRequestView(ResetPasswordRequestToken):
-    """
-    API endpoint to initiate a password reset.
-    """
-
-    throttle_classes = []
-
-    def get_user_by_email(self, email):
-        """
-        Optionally override the way users are fetched by e-mail.
-
-        NOTE: If your django-rest-passwordreset version does not call this method,
-        you may need to customize via its serializer or DJANGO_REST_LOOKUP_FIELD instead.
-        """
-        email = email.strip()
-        try:
-            return User.objects.get(email__iexact=email)
-        except User.DoesNotExist:
-            raise ValidationError(
-                {
-                    "email": _(
-                        "We couldn't find an account associated with that e-mail. "
-                        "Please check the address and try again."
-                    )
-                }
-            )
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [PasswordResetThrottle]
 
 
 @extend_schema(summary="Validate password reset token", tags=["Password Reset"])
 class CustomPasswordResetValidateView(ResetPasswordValidateToken):
-    """
-    Thin wrapper for the built-in validate-token view so it appears in the schema.
-    """
-    pass
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [PasswordResetThrottle]
 
 
 @extend_schema(summary="Confirm password reset", tags=["Password Reset"])
 class CustomPasswordResetConfirmView(ResetPasswordConfirm):
-    """
-    Thin wrapper for the built-in confirm-reset view so it appears in the schema.
-    """
-    pass
+    authentication_classes = []
+    permission_classes = [AllowAny]
+    throttle_classes = [PasswordResetThrottle]
 
 
+# -----------------------------
+# Password change (auth)
+# -----------------------------
 @extend_schema(
     summary="Change password for authenticated user",
     description="Change the password for the currently authenticated user.",
@@ -420,10 +457,6 @@ class CustomPasswordResetConfirmView(ResetPasswordConfirm):
     tags=["Password Management"],
 )
 class PasswordChangeView(generics.UpdateAPIView):
-    """
-    Endpoint for changing the password of the authenticated user.
-    """
-
     serializer_class = PasswordChangeSerializer
     permission_classes = [IsAuthenticated]
 
@@ -431,301 +464,129 @@ class PasswordChangeView(generics.UpdateAPIView):
         return self.request.user
 
     def update(self, request, *args, **kwargs):
-        serializer = self.get_serializer(
-            data=request.data,
-            context={"request": request},
-        )
+        serializer = self.get_serializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
+
         user = self.get_object()
         serializer.save()
+
         send_password_change_email.delay(user.id)
-        return Response(
-            {"detail": _("Your password has been changed successfully.")},
-            status=status.HTTP_200_OK,
-        )
+        return Response({"detail": _("Your password has been changed successfully.")}, status=status.HTTP_200_OK)
 
 
+# -----------------------------
+# Logout (public but CSRF-protected)
+# -----------------------------
 @extend_schema(
     summary="Logout",
-    description=(
-        "Logs out the user by blacklisting the refresh token (if present) and "
-        "deleting all authentication cookies."
-    ),
+    description="Clears auth cookies and blacklists refresh token if present.",
+    request=None,  # No request body required
     responses={
-        200: OpenApiResponse(description="Logged out successfully."),
-        400: OpenApiResponse(description="Token error."),
+        200: inline_serializer(
+            name="LogoutResponse",
+            fields={
+                "message": serializers.CharField(default="Logged out successfully."),
+            },
+        ),
     },
     tags=["Authentication"],
 )
 @api_view(["POST"])
+@authentication_classes([])  # do not let expired access cookie block logout
+@permission_classes([AllowAny])
+@throttle_classes([RefreshThrottle])
 def logout_view(request):
-    """
-    Logout endpoint. Blacklists the refresh token (if present) and
-    clears access, refresh and CSRF cookies.
-    """
     refresh_token = request.COOKIES.get("refresh_token")
     if refresh_token:
         try:
             token = RefreshToken(refresh_token)
             token.blacklist()
-            logger.info(
-                "Refresh token blacklisted for user: %s",
-                getattr(request.user, "email", "anonymous"),
-            )
+            logger.info("Refresh token blacklisted during logout for %s.", getattr(request.user, "email", "anonymous"))
         except TokenError as e:
-            logger.warning(
-                "Error blacklisting refresh token (possibly invalid/expired): %s",
-                e,
-            )
+            logger.warning("Logout blacklist failed (token invalid/expired): %s", e)
         except Exception as e:
-            logger.error("Unexpected error during token blacklisting: %s", e)
-    else:
-        logger.info("Logout attempt without refresh token in cookies.")
+            logger.error("Unexpected error during logout blacklisting: %s", e)
 
-    response = Response(
-        {"message": "Logged out successfully."},
-        status=status.HTTP_200_OK,
-    )
+    response = Response({"message": "Logged out successfully."}, status=status.HTTP_200_OK)
     delete_auth_cookies(response)
     return response
 
 
+# -----------------------------
+# Admin user management
+# -----------------------------
 @extend_schema(
     summary="List users (Admin only)",
     description="List all user accounts. Requires Admin privileges.",
     responses={
-        200: OpenApiResponse(
-            description="List of users retrieved successfully.",
-            response=UserSerializer(many=True),
-        ),
+        200: OpenApiResponse(description="List of users retrieved successfully.", response=UserSerializer(many=True)),
         403: OpenApiResponse(description="Permission denied."),
     },
     tags=["User Management"],
 )
 class UserListView(generics.ListAPIView):
-    """
-    List all users. Admin-only endpoint.
-    """
-
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated, IsAdmin]
     queryset = User.objects.all().order_by("id")
-
-    def get(self, request, *args, **kwargs):
-        logger.info("Admin %s accessed the user list.", request.user.get_full_name())
-        return super().get(request, *args, **kwargs)
 
 
 @extend_schema(
     summary="Current user profile",
     description="Retrieve the profile of the currently authenticated user.",
-    responses={
-        200: OpenApiResponse(
-            description="User data retrieved successfully.",
-            response=UserSerializer,
-        ),
-        401: OpenApiResponse(description="Authentication credentials were not provided."),
-    },
+    responses={200: OpenApiResponse(description="User data retrieved successfully.", response=UserSerializer)},
     tags=["Authentication"],
 )
 class CurrentUserView(generics.RetrieveAPIView):
-    """
-    Retrieve the current user's profile.
-    """
-
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
 
     def get_object(self):
         return self.request.user
 
-    def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
-        serializer = self.get_serializer(instance)
-        logger.info("User %s retrieved their profile.", request.user.email)
-        return Response(serializer.data)
-
 
 @extend_schema(
     summary="User details by ID (Admin only)",
-    description=(
-        "Retrieve, update or delete a user account by ID. "
-        "Only Admin users can access this endpoint."
-    ),
-    responses={
-        200: OpenApiResponse(
-            description="User data retrieved or updated successfully.",
-            response=UserSerializer,
-        ),
-        204: OpenApiResponse(description="User account deleted successfully."),
-        400: OpenApiResponse(description="Validation error."),
-        401: OpenApiResponse(description="Authentication credentials were not provided."),
-        403: OpenApiResponse(description="Permission denied."),
-        404: OpenApiResponse(description="User not found."),
-    },
+    description="Retrieve, update or delete a user account by ID. Only Admin users can access this endpoint.",
+    responses={200: OpenApiResponse(description="User data retrieved or updated successfully.", response=UserSerializer)},
     tags=["User Management"],
 )
 class UserDetailRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
-    """
-    Retrieve, update, or delete a user by ID. Admin-only.
-    """
-
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated, IsAdmin]
 
-    def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
-        serializer = self.get_serializer(instance)
-        logger.info(
-            "Admin %s retrieved profile for user ID: %s.",
-            request.user.email,
-            instance.id,
-        )
-        return Response(serializer.data)
-
-    def update(self, request, *args, **kwargs):
-        partial = kwargs.pop("partial", False)
-        instance = self.get_object()
-        serializer = self.get_serializer(
-            instance,
-            data=request.data,
-            partial=partial,
-        )
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-        logger.info(
-            "Admin %s updated profile for user ID: %s.",
-            request.user.email,
-            instance.id,
-        )
-        return Response(serializer.data)
-
-    @extend_schema(
-        operation_id="delete_user_by_id",
-        summary="Delete user by ID (Admin only)",
-        description=(
-            "Delete a specific user by their ID. Admins cannot delete their own "
-            "account via this endpoint."
-        ),
-        request=None,
-        responses={
-            204: OpenApiResponse(
-                description="User deleted successfully.",
-                response=None,
-            ),
-            403: OpenApiResponse(
-                description=(
-                    "Permission denied (non-admin, or admin trying to delete self)."
-                ),
-                response=inline_serializer(
-                    name="ForbiddenDeleteResponse",
-                    fields={
-                        "detail": serializers.CharField(
-                            default="Permission denied.",
-                        )
-                    },
-                ),
-            ),
-        },
-        tags=["User Management"],
-    )
     def delete(self, request, *args, **kwargs):
         user_to_delete = self.get_object()
-        requester_email = getattr(request.user, "email", "N/A")
-        logger.info(
-            "Admin %s attempting to delete user %s (ID: %s).",
-            requester_email,
-            user_to_delete.email,
-            user_to_delete.id,
-        )
 
         if request.user.id == user_to_delete.id:
-            logger.warning(
-                "Admin %s attempted to self-delete via API.", requester_email
-            )
             return Response(
-                {
-                    "detail": _(
-                        "Administrators cannot delete their own account using this "
-                        "endpoint. Please use Django admin if necessary."
-                    )
-                },
+                {"detail": _("Administrators cannot delete their own account using this endpoint.")},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
         self.perform_destroy(user_to_delete)
-        logger.info(
-            "Admin %s deleted user %s (ID: %s).",
-            requester_email,
-            user_to_delete.email,
-            user_to_delete.id,
-        )
         return Response(status=status.HTTP_204_NO_CONTENT)
-    
+
 
 @extend_schema(
     summary="Get or update a user's permissions (Admin Only)",
-    description=(
-        "Returns default permissions for the user's role (from the matching Group) and "
-        "their current user-specific permissions. "
-        "PATCH allows admins to set the exact list of extra permissions for the user."
-    ),
-    responses={
-        200: OpenApiResponse(
-            description="User permissions retrieved or updated successfully.",
-            response=UserPermissionsSerializer,
-        ),
-        403: OpenApiResponse(description="Permission denied."),
-        404: OpenApiResponse(description="User not found."),
-    },
+    description="Returns role group permissions + user-specific permissions. PATCH sets exact user permissions list.",
+    responses={200: OpenApiResponse(description="User permissions retrieved or updated successfully.", response=UserPermissionsSerializer)},
     tags=["User Management"],
 )
 class UserPermissionsView(generics.RetrieveUpdateAPIView):
-    """
-    Admin-only endpoint to view and modify a user's permissions.
-    """
-
     serializer_class = UserPermissionsSerializer
     permission_classes = [IsAuthenticated, IsAdmin]
     queryset = User.objects.all()
-
-    def get(self, request, *args, **kwargs):
-        user = self.get_object()
-        serializer = self.get_serializer(user)
-        return Response(serializer.data)
-
-    def patch(self, request, *args, **kwargs):
-        user = self.get_object()
-        serializer = self.get_serializer(user, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        updated_user = serializer.save()
-
-        logger.info(
-            "Admin %s updated user-specific permissions for %s (ID: %s).",
-            request.user.email,
-            updated_user.email,
-            updated_user.id,
-        )
-
-        return Response(self.get_serializer(updated_user).data)
 
 
 @extend_schema(
     summary="List all permissions (Admin Only)",
     description="Returns all Django permissions in the system.",
-    responses={
-        200: OpenApiResponse(
-            description="Permissions listed successfully.",
-            response=PermissionSerializer(many=True),
-        )
-    },
+    responses={200: OpenApiResponse(description="Permissions listed successfully.", response=PermissionSerializer(many=True))},
     tags=["User Management"],
 )
 class PermissionListView(generics.ListAPIView):
-    """
-    Admin-only list of all permissions. Useful for building a permission matrix UI.
-    """
     serializer_class = PermissionSerializer
     permission_classes = [IsAuthenticated, IsAdmin]
     queryset = Permission.objects.all().order_by("content_type__app_label", "codename")

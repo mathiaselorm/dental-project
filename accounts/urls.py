@@ -1,42 +1,25 @@
 from django.urls import path
+
 from . import views
-# from django_rest_passwordreset.views import (
-#     ResetPasswordConfirm, 
-#     ResetPasswordValidateToken,
-#     # ResetPasswordRequestToken
-# )
-
-
 
 urlpatterns = [
-    # Authentication endpoints
-    path('auth/login/', views.CustomTokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('auth/refresh/', views.CustomTokenRefreshView.as_view(), name='token_refresh'),
-    path('auth/logout/', views.logout_view, name='logout'),
-    path('auth/me/', views.CurrentUserView.as_view(), name='current-user'),
+    # --- Auth (Cookie JWT) ---
+    path("csrf/", views.CSRFCookieView.as_view(), name="csrf-cookie"),
+    path("login/", views.CustomTokenObtainPairView.as_view(), name="auth-login"),
+    path("refresh/", views.CustomTokenRefreshView.as_view(), name="auth-refresh"),
+    path("logout/", views.logout_view, name="auth-logout"),
+    path("me/", views.CurrentUserView.as_view(), name="auth-me"),
 
+    # --- Password reset / management ---
+    path("password-reset/request/", views.CustomPasswordResetRequestView.as_view(), name="password-reset-request"),
+    path("password-reset/validate/", views.CustomPasswordResetValidateView.as_view(), name="password-reset-validate"),
+    path("password-reset/confirm/", views.CustomPasswordResetConfirmView.as_view(), name="password-reset-confirm"),
+    path("password/change/", views.PasswordChangeView.as_view(), name="password-change"),
 
-    # Password Management endpoints
-    path('password-reset/request/', views.CustomPasswordResetRequestView.as_view(), name='password_reset'),
-    path('password-reset/confirm/', views.CustomPasswordResetConfirmView.as_view(), name='password_reset_confirm'),
-    path('password-reset/validate-token/', views.CustomPasswordResetValidateView.as_view(), name='password_reset_validate_token'),
-    path('password/change/', views.PasswordChangeView.as_view(), name='password-change'),
-
-    # User management endpoints
-    path('users/', views.UserListView.as_view(), name='user-list'),
-    path('users/register/', views.UserRegistrationView.as_view(), name='user-registration'),
-    path('users/<uuid:pk>/', views.UserDetailRetrieveUpdateDestroyView.as_view(), name='user-details'),
-    
-    #Permisiion endpoints
-    path('users/<uuid:pk>/permissions/', views.UserPermissionsView.as_view(), name='user-permissions'),
-    path("permissions/", views.PermissionListView.as_view(), name="permission-list"), 
+    # --- User management (Admin) ---
+    path("users/", views.UserListView.as_view(), name="users-list"),
+    path("users/register/", views.UserRegistrationView.as_view(), name="users-register"),
+    path("users/<uuid:pk>/", views.UserDetailRetrieveUpdateDestroyView.as_view(), name="users-detail"),
+    path("users/<uuid:pk>/permissions/", views.UserPermissionsView.as_view(), name="users-permissions"),
+    path("permissions/", views.PermissionListView.as_view(), name="permissions-list"),
 ]
-
-
-
-
-
-
-
-
-
